@@ -204,7 +204,7 @@ class Model(nn.Module) :
         return self.fc3(x)
     
     
-    def generate(self, mels, batched, target, overlap) :
+    def generate(self, mels, batched, target, overlap, ap) :
         
         self.eval()
         output = []

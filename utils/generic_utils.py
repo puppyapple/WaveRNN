@@ -141,3 +141,34 @@ def check_update(model, grad_clip):
         print(" [!] Gradient is nan.")
         skip_flag = True
     return grad_norm, skip_flag
+
+
+class KeepAverage():
+    def __init__(self):
+        self.avg_values = {}
+        self.iters = {}
+
+    def __getitem__(self, key):
+        return self.avg_values[key]
+
+    def add_value(self, name, init_val=0, init_iter=0):
+        self.avg_values[name] = init_val
+        self.iters[name] = init_iter
+
+    def update_value(self, name, value, weighted_avg=False):
+        if weighted_avg:
+            self.avg_values[name] = 0.99 * self.avg_values[name] + 0.01 * value
+            self.iters[name] += 1
+        else:
+            self.avg_values[name] = self.avg_values[name] * \
+                self.iters[name] + value
+            self.iters[name] += 1
+            self.avg_values[name] /= self.iters[name]
+
+    def add_values(self, name_dict):
+        for key, value in name_dict.items():
+            self.add_value(key, init_val=value)
+
+    def update_values(self, value_dict):
+        for key, value in value_dict.items():
+            self.update_value(key, value)

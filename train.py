@@ -17,6 +17,8 @@ from torch.utils.data.distributed import DistributedSampler
 from dataset import MyDataset
 from distribute import *
 from models.wavernn import Model
+from utils.generic_utils import KeepAverage
+from utils.logger import Logger
 from utils.audio import AudioProcessor
 from utils.display import *
 from utils.distribution import discretized_mix_logistic_loss, gaussian_loss
@@ -78,10 +80,18 @@ def train(model, optimizer, criterion, scheduler, epochs, batch_size, step, lr, 
         # train loop
         print(" > Training", flush=True)
         model.train()
+        epoch_time = 0
+        train_values = {
+            'avg_loss': 0,
+        }
+        keep_avg = KeepAverage()
+        keep_avg.add_values(train_values)
+        
         for i, (x, m, y) in enumerate(train_loader):
+            iter_start = time.time()
             if use_cuda:
                 x, m, y = x.cuda(), m.cuda(), y.cuda()
-            scheduler.step()
+            # scheduler.step()
             optimizer.zero_grad()
             y_hat = model(x, m)
             # y_hat = y_hat.transpose(1, 2)
@@ -103,37 +113,68 @@ def train(model, optimizer, criterion, scheduler, epochs, batch_size, step, lr, 
                     loss = reduce_tensor(loss.data, num_gpus)
                 running_loss += loss.item()
                 avg_loss = running_loss / (i + 1 - skipped_steps)
+                
             else:
                 print(" [!] Skipping the step...")
                 skipped_steps += 1
+            # move scheduler after optimizer step  
+            scheduler.step()
+            
             speed = (i + 1) / (time.time() - start)
             step += 1
             cur_lr = optimizer.param_groups[0]["lr"]
+            
+            step_time = time.time() - iter_start
+            epoch_time += step_time
             
             if step % CONFIG.print_step == 0:
                 print(
                     " | > Epoch: {}/{} -- Batch: {}/{} -- Loss: {:.3f}"
                     " -- Speed: {:.2f} steps/sec -- Step: {} -- lr: {} -- GradNorm: {}".format(
-                        e + 1, epochs, i + 1, iters, avg_loss, speed, step, cur_lr, grad_norm
+                        e + 1, epochs, i + 1, iters, loss, speed, step, cur_lr, grad_norm
                     ), flush=True
                 )
-            if step % CONFIG.checkpoint_step == 0 and args.rank == 0:
-                save_checkpoint(model, optimizer, avg_loss, MODEL_PATH, step, e)
-                print(" > checkpoint saved", flush=True)
+            if args.rank == 0:
+                update_train_values = {
+                    "avg_loss": loss
+                }
+                keep_avg.update_values(update_train_values)
+                
+                if step % CONFIG.checkpoint_step == 0:
+                    save_checkpoint(model, optimizer, avg_loss, MODEL_PATH, step, e)
+                    print(" > checkpoint saved", flush=True)
+                    
+                if step % 3 == 0:
+                    iter_stats = {
+                        "iter_loss": loss,
+                        "grad_norm": grad_norm,
+                        "step_time": step_time
+                    }
+                    tb_logger.tb_train_iter_stats(step, iter_stats)
         # visual
         # m_scaled, _ = model.upsample(m)
         # plot_spec(m[0], VIS_PATH + "/mel_{}.png".format(step))
         # plot_spec(
         #     m_scaled[0].transpose(0, 1), VIS_PATH + "/mel_scaled_{}.png".format(step)
         # )
+        
+        # end_time = time.time()
+        if args.rank == 0:
+            # Plot Training Epoch Stats
+            epoch_stats = {
+                "avg_loss": keep_avg['avg_loss'],
+                "epoch_time": epoch_time
+            }
+            tb_logger.tb_train_epoch_stats(step, epoch_stats)
+            
         # validation loop
-        avg_val_loss = evaluate(model, criterion, batch_size)
+        avg_val_loss = evaluate(model, criterion, batch_size, step)
         if args.rank == 0:
             best_loss = save_best_model(model, optimizer, avg_val_loss, best_loss, MODEL_PATH, step, e)
 
 
 
-def evaluate(model, criterion, batch_size):
+def evaluate(model, criterion, batch_size, step):
     global CONFIG
     global test_ids
     # create train loader
@@ -144,6 +185,13 @@ def evaluate(model, criterion, batch_size):
     # train loop
     print(" > Validation", flush=True)
     model.eval()
+    
+    eval_values_dict = {
+        'avg_loss': 0,
+    }
+    keep_avg = KeepAverage()
+    keep_avg.add_values(eval_values_dict)
+    
     val_step = 0
     with torch.no_grad():
         for i, (x, m, y) in enumerate(val_loader):
@@ -168,6 +216,14 @@ def evaluate(model, criterion, batch_size):
                         iters, val_step, avg_val_loss
                     )
                 )
+            keep_avg.update_value("avg_loss", loss)
+            
+        if args.rank == 0:
+            epoch_stats = {
+                "avg_loss": keep_avg['avg_loss']
+            }
+            tb_logger.tb_eval_stats(step, epoch_stats)            
+        
         print(" | > Validation Loss: {}".format(avg_val_loss), flush=True)
     return avg_val_loss
 
@@ -175,7 +231,6 @@ def evaluate(model, criterion, batch_size):
 def main(args):
     global train_ids
     global test_ids
-
     # read meta data
     with open(f"{DATA_PATH}/dataset_ids.pkl", "rb") as f:
         train_ids = pickle.load(f)
@@ -298,24 +353,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     CONFIG = load_config(args.config_path)
 
-    if args.data_path != "":
-        CONFIG.data_path = args.data_path
-    DATA_PATH = CONFIG.data_path
-
-    # DISTRUBUTED
-    if num_gpus > 1:
-        init_distributed(
-            args.rank,
-            num_gpus,
-            args.group_id,
-            CONFIG.distributed["backend"],
-            CONFIG.distributed["url"],
-        )
-
-    global ap
-    ap = AudioProcessor(**CONFIG.audio)
-    mode = CONFIG.mode
-
     # setup output paths and read configs
     _ = os.path.dirname(os.path.realpath(__file__))
     if args.data_path != "":
@@ -330,6 +367,28 @@ if __name__ == "__main__":
         OUT_PATH = create_experiment_folder(OUT_PATH, CONFIG.model_name)
 
     AUDIO_PATH = os.path.join(OUT_PATH, "test_audios")
+    DATA_PATH = CONFIG.data_path
+
+    if args.rank == 0:
+        LOG_DIR = OUT_PATH
+        print("Logger created.")
+        tb_logger = Logger(LOG_DIR)    
+    
+    # DISTRUBUTED
+    if num_gpus > 1:
+        init_distributed(
+            args.rank,
+            num_gpus,
+            args.group_id,
+            CONFIG.distributed["backend"],
+            CONFIG.distributed["url"],
+        )
+
+    global ap
+    ap = AudioProcessor(**CONFIG.audio)
+    mode = CONFIG.mode
+
+
 
     if args.rank == 0:
         # set paths
@@ -347,7 +406,7 @@ if __name__ == "__main__":
         shutil.copyfile(args.config_path, os.path.join(OUT_PATH, "config.json"))
         os.chmod(AUDIO_PATH, 0o775)
         os.chmod(OUT_PATH, 0o775)
-
+        
     try:
         main(args)
     except KeyboardInterrupt:
