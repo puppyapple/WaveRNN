@@ -236,7 +236,7 @@ class AudioProcessor(object):
             x, sr = librosa.load(filename, sr=sr)
         if self.do_trim_silence:
             x = self.trim_silence(x)
-        assert self.sample_rate == sr, "%s vs %s"%(self.sample_rate, sr)
+        assert self.sample_rate == sr, "%s vs %s" % (self.sample_rate, sr)
         return x
 
     def encode_16bits(self, x):

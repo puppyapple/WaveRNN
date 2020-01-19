@@ -1,6 +1,6 @@
 {
     "model_name": "WaveRNN",
-    "model_description": "Mulaw and 9 bits",
+    "model_description": "Mulaw and 10 bits",
 
     "audio":{
         "audio_processor": "audio",        
@@ -33,7 +33,7 @@
     "grad_clip": 1000,
     "lr": 0.0001,
     "warmup_steps": 100,
-    "batch_size": 50,
+    "batch_size": 40,
     "checkpoint_step": 1000,
     "print_step": 1,
     "num_workers": 4,
@@ -42,7 +42,7 @@
     "use_aux_net": true,
     "use_upsample_net": true,
     "upsample_factors": [5, 5, 24],
-    "mode": 9,
+    "mode": 10,
     "mulaw": true,
 
     "data_path": "/search/hadoop07/wuzijun/voice_data/Biaobei/Mels/",

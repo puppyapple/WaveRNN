@@ -15,7 +15,7 @@ except:
 def stream(string, variables) :
     sys.stdout.write(f'\r{string}' % variables)
 
-
+# 残差卷积网络
 class ResBlock(nn.Module) :
     def __init__(self, dims) :
         super().__init__()
@@ -33,8 +33,9 @@ class ResBlock(nn.Module) :
         x = self.batch_norm2(x)
         return x + residual
 
-
+# 输入一维卷积 + res_blocks个残差block + 输出一维卷积（kernel size为1）
 class MelResNet(nn.Module) :
+    # res_blocks=10, in_dims=feat_dims=80, compute_dims=res_out_dims=128
     def __init__(self, res_blocks, in_dims, compute_dims, res_out_dims, pad) :
         super().__init__()
         k_size = pad * 2 + 1
@@ -46,14 +47,17 @@ class MelResNet(nn.Module) :
         self.conv_out = nn.Conv1d(compute_dims, res_out_dims, kernel_size=1)
         
     def forward(self, x) :
+        # (B, feat_dims or channel, *) => (B, compute_dims, *)
         x = self.conv_in(x)
         x = self.batch_norm(x)
         x = F.relu(x)
+        # (B, compute_dims, *) => (B, compute_dims, *)
         for f in self.layers : x = f(x)
+        # (B, compute_dims, *) => (B, res_out_dims, *)
         x = self.conv_out(x)
         return x
 
-
+# 将张量x在h和w两个轴的方向上分别进行block重复
 class Stretch2d(nn.Module) :
     def __init__(self, x_scale, y_scale) :
         super().__init__()
@@ -61,9 +65,13 @@ class Stretch2d(nn.Module) :
         self.y_scale = y_scale
         
     def forward(self, x) :
+        # b-batch size, c-filter number, H, W-spatial dimension
         b, c, h, w = x.size()
+        # 先将h和w维度前插入1维
         x = x.unsqueeze(-1).unsqueeze(3)
+        # 再将这里面的h轴和w轴各自以x_scale和y_scale进行repeat
         x = x.repeat(1, 1, 1, self.y_scale, 1, self.x_scale)
+        # 最后通过view将shape进行调整
         return x.view(b, c, h * self.y_scale, w * self.x_scale)
 
 
@@ -71,6 +79,7 @@ class UpsampleNetwork(nn.Module) :
     def __init__(self, feat_dims, upsample_scales, compute_dims, 
                  res_blocks, res_out_dims, pad, use_aux_net) :
         super().__init__()
+        # total_scale == hop_length
         self.total_scale = np.cumproduct(upsample_scales)[-1]
         self.indent = pad * self.total_scale
         self.use_aux_net = use_aux_net
@@ -78,25 +87,36 @@ class UpsampleNetwork(nn.Module) :
             self.resnet = MelResNet(res_blocks, feat_dims, compute_dims, res_out_dims, pad)
             self.resnet_stretch = Stretch2d(self.total_scale, 1)
         self.up_layers = nn.ModuleList()
+        # upsample_scales-[5, 5, 24]
         for scale in upsample_scales :
             k_size = (1, scale * 2 + 1)
             padding = (0, scale)
             stretch = Stretch2d(scale, 1)
             conv = nn.Conv2d(1, 1, kernel_size=k_size, padding=padding, bias=False)
+            # 为什么这样进行初始化？
             conv.weight.data.fill_(1. / k_size[1])
             self.up_layers.append(stretch)
             self.up_layers.append(conv)
     
     def forward(self, m) :
         if self.use_aux_net:
+            # (B, channel, *) => (B, 1, res_out_dims, *)
             aux = self.resnet(m).unsqueeze(1)
+            # (B, 1, res_out_dims, *) => (B, 1, res_out_dims x 1, * x hop_length)
             aux = self.resnet_stretch(aux)
+            # (B, 1, res_out_dims x 1, * x hop_length) => (B, res_out_dims, * x hop_length)
             aux = aux.squeeze(1)
+            # (B, res_out_dims, * x hop_length) => (B, * x hop_length, res_out_dims)
             aux = aux.transpose(1, 2)
         else:
             aux = None
+        # (B, channel, *) => (B, 1, channel, *)
         m = m.unsqueeze(1)
+        # (B, 1, channel, *) => (B, 1, channel x 1, * x hop_length)
         for f in self.up_layers : m = f(m)
+        # * == # + 2 x pad
+        # (B, channel, * x hop_length)[:, :, -indent:indent]
+        # => (B, channel, # x hop_length)
         m = m.squeeze(1)[:, :, self.indent:-self.indent]
         return m.transpose(1, 2), aux
 
@@ -112,12 +132,20 @@ class Upsample(nn.Module):
     
     def forward(self, m):
         if self.use_aux_net:
+            # (B, channel, *) => (B, res_out_dims, *)
             aux = self.resnet(m)
+            # self.scale == hop_length
+            # (B, res_out_dims, *) => (B, res_out_dims, * x hop_length)
             aux = torch.nn.functional.interpolate(aux, scale_factor= self.scale, mode='linear', align_corners=True)
+            # (B, res_out_dims, * x hop_length) => (B, * x hop_length, res_out_dims)
             aux = aux.transpose(1, 2)
         else:
             aux = None
+        # * == # + 2 x pad
+        # (B, channel, (# + 2 x pad) x hop_length) => (B, channel, # x hop_length)
         m = torch.nn.functional.interpolate(m, scale_factor= self.scale, mode='linear', align_corners=True)
+        # (B, channel, # x hop_length + 2 x indent)[:, :, -indent:indent]
+        # => (B, channel, # x hop_length)
         m = m[:, :, self.indent:-self.indent]
         m = m * 0.045   # empirically found
 
@@ -148,6 +176,7 @@ class Model(nn.Module) :
         self.hop_length = hop_length
         self.sample_rate = sample_rate
 
+        # feat_dims == 80
         if self.use_upsample_net:
             assert np.cumproduct(upsample_factors)[-1] == self.hop_length, " [!] upsample scales needs to be equal to hop_length"
             self.upsample = UpsampleNetwork(feat_dims, upsample_factors, compute_dims, 
@@ -172,26 +201,35 @@ class Model(nn.Module) :
     
     def forward(self, x, mels) :
         bsize = x.size(0)
+        # for rnn input, h0 is always batch 'second'
         h1 = torch.zeros(1, bsize, self.rnn_dims).cuda()
         h2 = torch.zeros(1, bsize, self.rnn_dims).cuda()
         mels, aux = self.upsample(mels)
-        
+        # aux-(B, * x hop_length, res_out_dims)
         if self.use_aux_net:
             aux_idx = [self.aux_dims * i for i in range(5)]
+            # (B, * x hop_length, window_i)
             a1 = aux[:, :, aux_idx[0]:aux_idx[1]]
             a2 = aux[:, :, aux_idx[1]:aux_idx[2]]
             a3 = aux[:, :, aux_idx[2]:aux_idx[3]]
             a4 = aux[:, :, aux_idx[3]:aux_idx[4]]
-        
+        # (B, # x hop_length, 1)
+        # (B, # x hop_length, channel)
+        # (B, # x hop_length, aux_dims)
         x = torch.cat([x.unsqueeze(-1), mels, a1], dim=2) if self.use_aux_net else torch.cat([x.unsqueeze(-1), mels], dim=2)
+        # (B, # x hop_length, 1 + channel + aux_dims or 0)
+        # => (B, # x hop_length, rnn_dims)
         x = self.I(x)
         res = x
+        # 每次正向传播时重置rnn参数减小内存消耗
         self.rnn1.flatten_parameters()
+        # (B, # x hop_length, rnn_dims)
         x, _ = self.rnn1(x, h1)
         
         x = x + res
         res = x
         x = torch.cat([x, a2], dim=2) if self.use_aux_net else x
+        # 每次正向传播时重置rnn参数减小内存消耗
         self.rnn2.flatten_parameters()
         x, _ = self.rnn2(x, h2)
         

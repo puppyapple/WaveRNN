@@ -269,7 +269,7 @@ def main(args):
     step = 0
     # restore any checkpoint
     if args.restore_path:
-        checkpoint = torch.load(args.restore_path)
+        checkpoint = torch.load(args.restore_path, map_location="cpu")
         try:
             model.load_state_dict(checkpoint["model"])
             # TODO: fix resetting restored optimizer lr 
